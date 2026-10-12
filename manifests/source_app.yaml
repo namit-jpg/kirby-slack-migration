@@ -1,0 +1,38 @@
+# Paste into https://api.slack.com/apps -> Create New App -> From a manifest (SOURCE workspace).
+# After installing, copy the "Bot User OAuth Token" (xoxb-) into SOURCE_TOKEN.
+# Bots only see private channels they've been invited to: /invite @Migration Exporter in each one,
+# or use the installing admin's "User OAuth Token" (xoxp-) instead to export every channel they're in.
+display_information:
+  name: Migration Exporter
+  description: Read-only export of users, channels and messages for a workspace migration.
+features:
+  bot_user:
+    display_name: Migration Exporter
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - users:read
+      - users:read.email
+      - channels:read
+      - channels:history
+      - channels:join
+      - groups:read
+      - groups:history
+      - files:read
+      - reactions:read
+      - pins:read
+    user:
+      - users:read
+      - users:read.email
+      - channels:read
+      - channels:history
+      - groups:read
+      - groups:history
+      - files:read
+      - reactions:read
+      - pins:read
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

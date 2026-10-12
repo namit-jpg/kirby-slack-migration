@@ -1,0 +1,40 @@
+# Paste into https://api.slack.com/apps -> Create New App -> From a manifest (TARGET workspace).
+# Replace the redirect URL with your HTTPS tunnel (e.g. `ngrok http 3000`) + /slack/oauth/callback,
+# then copy Client ID / Client Secret from "Basic Information" into .env.
+# Do NOT enable token rotation: rotated user tokens expire after 12 hours.
+display_information:
+  name: Migration Importer
+  description: Recreates the old workspace's history, posting each message as its original author.
+features:
+  bot_user:
+    display_name: Migration Importer
+    always_online: false
+oauth_config:
+  redirect_urls:
+    - https://YOUR-TUNNEL.example.com/slack/oauth/callback
+  scopes:
+    bot:
+      - users:read
+      - users:read.email
+      - channels:read
+      - groups:read
+      - chat:write
+      - chat:write.public
+      - chat:write.customize
+    user:
+      - chat:write
+      - channels:read
+      - channels:write
+      - groups:read
+      - groups:write
+      - reactions:write
+      - files:read
+      - files:write
+      - pins:write
+      - users:read
+      - users:read.email
+      - users.profile:write
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

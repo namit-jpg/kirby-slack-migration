@@ -1,0 +1,3 @@
+slack_sdk>=3.33
+python-dotenv>=1.0
+pytest>=8.0

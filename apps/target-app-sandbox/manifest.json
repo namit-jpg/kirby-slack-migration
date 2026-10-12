@@ -1,0 +1,50 @@
+{
+  "_metadata": {
+    "major_version": 2
+  },
+  "display_information": {
+    "name": "Migration Importer",
+    "description": "Recreates the old workspace's history, posting each message as its original author."
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Migration Importer",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "users:read",
+        "users:read.email",
+        "channels:read",
+        "groups:read",
+        "chat:write",
+        "chat:write.public",
+        "chat:write.customize"
+      ],
+      "user": [
+        "chat:write",
+        "channels:read",
+        "channels:write",
+        "groups:read",
+        "groups:write",
+        "reactions:write",
+        "files:read",
+        "files:write",
+        "pins:write",
+        "users:read",
+        "users:read.email",
+        "users.profile:write"
+      ]
+    },
+    "redirect_urls": [
+      "https://fetch-manly-stencil.ngrok-free.dev/slack/oauth/callback"
+    ]
+  },
+  "settings": {
+    "org_deploy_enabled": true,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
