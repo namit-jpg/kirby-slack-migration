@@ -119,6 +119,8 @@ def main(argv: list[str] | None = None) -> None:
                 source_client_id=os.environ.get("SOURCE_CLIENT_ID"),
                 source_client_secret=os.environ.get("SOURCE_CLIENT_SECRET"),
                 source_redirect_uri=os.environ.get("SOURCE_REDIRECT_URI"),
+                source_workspace_name=os.environ.get("SOURCE_WORKSPACE_NAME"),
+                target_workspace_name=os.environ.get("TARGET_WORKSPACE_NAME"),
             )
             serve(app, args.host, args.port, args.cert, args.key)
 

@@ -90,8 +90,11 @@ class OAuthApp:
         source_client_id: str | None = None,
         source_client_secret: str | None = None,
         source_redirect_uri: str | None = None,
+        source_workspace_name: str | None = None,
+        target_workspace_name: str | None = None,
     ):
         self.store = store
+        self.workspace_names = {SOURCE: source_workspace_name, TARGET: target_workspace_name}
         self.apps = {TARGET: (client_id, client_secret, redirect_uri)}
         if source_client_id and source_client_secret:
             self.apps[SOURCE] = (source_client_id, source_client_secret, source_redirect_uri or redirect_uri)
@@ -124,6 +127,16 @@ class OAuthApp:
     def _target_button(self) -> str:
         return f'<a class="btn" href="{html.escape(self.authorize_url(TARGET))}">Authorize the new workspace</a>'
 
+    def _signin_hint(self, side: str) -> str:
+        which = "old" if side == SOURCE else "new"
+        name = self.workspace_names.get(side)
+        if not name:
+            return f'<p class="muted">Sign in to the <b>{which}</b> workspace when Slack asks.</p>'
+        # Both orgs can list several similarly named workspaces in Slack's picker.
+        return (f'<p class="muted">On Slack\'s page, open the workspace dropdown at the top right and choose '
+                f'exactly <b>{html.escape(name)}</b> (the {which} workspace) before clicking Allow. '
+                f'A different workspace, even one with a similar name, won\'t work.</p>')
+
     def landing_page(self) -> str:
         if not self.collects_dms:
             return PAGE.format(
@@ -132,7 +145,7 @@ class OAuthApp:
 like you wrote them. Your token is stored only on the migration machine and is revoked after
 the migration finishes.</p>
 <p>{self._target_button()}</p>
-<p class="muted">Sign in to the <b>new</b> workspace when Slack asks.</p>"""
+{self._signin_hint(TARGET)}"""
             )
         source_url = html.escape(self.authorize_url(SOURCE))
         return PAGE.format(
@@ -143,11 +156,11 @@ the migration finishes.</p>
 <p>Lets the migration <b>read</b> your direct messages and group DMs so they can be recreated.
 Slack doesn't let anyone else read them, so without this step your DMs stay behind.</p>
 <p><a class="btn" href="{source_url}">Authorize the old workspace</a></p>
-<p class="muted">Sign in to the <b>old</b> workspace when Slack asks.</p>
+{self._signin_hint(SOURCE)}
 <h2>Step 2: new workspace</h2>
 <p>Lets the migration post your old messages <b>as you</b>, so they look exactly like you wrote them.</p>
 <p>{self._target_button()}</p>
-<p class="muted">Sign in to the <b>new</b> workspace when Slack asks.</p>"""
+{self._signin_hint(TARGET)}"""
         )
 
     def handle_callback(self, query: dict[str, list[str]]) -> tuple[int, str]:
