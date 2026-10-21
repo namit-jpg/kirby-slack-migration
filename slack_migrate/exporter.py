@@ -273,7 +273,8 @@ class Exporter:
                 continue
             count = 0
             try:
-                convs = list(paginate(client.conversations_list, "channels", types="im,mpim", limit=200))
+                # Org-level (Enterprise Grid) user tokens need the workspace too.
+                convs = list(paginate(client.conversations_list, "channels", types="im,mpim", limit=200, **self.team))
             except SlackApiError as exc:
                 log.warning("Could not list DMs for %s (%s)", email, error_code(exc))
                 continue
