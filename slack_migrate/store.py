@@ -6,9 +6,12 @@ Layout under the data dir:
       meta.json                 workspace info + when the export ran
       users.json                {old_user_id: user record}
       channels.json             {old_channel_id: channel record}
+      dms.json                  {old_dm_id: DM / group DM record}
       messages/<channel>.json   {ts: raw Slack message (+ _pinned, files[]._local_path)}
       files/<file_id>/<name>    downloaded attachments
       avatars/<user_id>.<ext>   profile photos
+    source/
+      tokens.json               per-user OAuth tokens for the source workspace, used to read DMs (chmod 600)
     target/
       tokens.json               OAuth tokens for the target workspace (chmod 600)
       state.json                what has been created/posted so far (makes runs resumable)
@@ -49,6 +52,7 @@ class Store:
     def __init__(self, root: str | Path):
         self.root = Path(root)
         self.export_dir = self.root / "export"
+        self.source_dir = self.root / "source"
         self.target_dir = self.root / "target"
 
     # ---- export (source workspace) ------------------------------------------------
@@ -79,6 +83,20 @@ class Store:
     def save_channels(self, channels: dict[str, dict]) -> None:
         _write_json(self.export_dir / "channels.json", channels)
 
+    def load_dms(self) -> dict[str, dict]:
+        return _read_json(self.export_dir / "dms.json", {})
+
+    def save_dms(self, dms: dict[str, dict]) -> None:
+        _write_json(self.export_dir / "dms.json", dms)
+
+    def load_source_tokens(self) -> dict:
+        tokens = _read_json(self.source_dir / "tokens.json", {})
+        tokens.setdefault("users", {})
+        return tokens
+
+    def save_source_tokens(self, tokens: dict) -> None:
+        _write_json(self.source_dir / "tokens.json", tokens, mode=0o600)
+
     def load_messages(self, channel_id: str) -> dict[str, dict]:
         return _read_json(self.export_dir / "messages" / f"{channel_id}.json", {})
 
@@ -103,6 +121,7 @@ class Store:
         state.setdefault("channels", {})
         state.setdefault("messages", {})
         state.setdefault("profiles", {})
+        state.setdefault("dms", {})
         return state
 
     def save_state(self, state: dict) -> None:

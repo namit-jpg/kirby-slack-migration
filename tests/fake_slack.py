@@ -114,6 +114,20 @@ class FakeClient:
             fail(errors[0]["error"])
         return {"ok": True, "errors": errors}
 
+    def conversations_open(self, users: str):
+        if self.is_bot:
+            fail("not_allowed_token_type")
+        members = set(users.split(",")) | {self.user_id}
+        if not members <= set(self.ws.users):
+            fail("user_not_found")
+        for ch in self.ws.channels.values():
+            if ch.get("is_dm") and ch["members"] == members:
+                return {"channel": {"id": ch["id"]}}
+        cid = self.ws.next_id("D" if len(members) <= 2 else "M")
+        self.ws.channels[cid] = {"id": cid, "name": "", "is_private": True, "is_dm": True, "members": members,
+                                 "messages": [], "archived": False, "topic": "", "purpose": ""}
+        return {"channel": {"id": cid}}
+
     def conversations_setTopic(self, channel: str, topic: str):
         self._ch(channel)["topic"] = topic
         return {"ok": True}

@@ -1,4 +1,8 @@
-"""Source-workspace app: dump users, channels, messages, threads, reactions, pins and files.
+"""Source-workspace app: dump users, channels, DMs, messages, threads, reactions, pins and files.
+
+Channels are read with SOURCE_TOKEN. DMs and group DMs can only be read with a participant's
+own user token, collected per person by ``serve-oauth`` (step 1 of the authorization page).
+Each conversation is exported once, with the token of whichever participant comes first.
 
 Every run is a full re-export that overwrites the previous snapshot. The importer keys its
 progress on the original message ``ts``, so re-exporting is safe and is exactly how a
@@ -15,7 +19,7 @@ from pathlib import Path
 
 from slack_sdk.errors import SlackApiError
 
-from .slack import error_code, paginate, today
+from .slack import ClientFactory, error_code, make_client, paginate, today
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -67,19 +71,50 @@ def _download(url: str, token: str, dest: Path) -> bool:
 
 
 class Exporter:
-    def __init__(self, client, token: str, store: Store, download_files: bool = True, team_id: str | None = None):
+    def __init__(
+        self,
+        client,
+        token: str,
+        store: Store,
+        download_files: bool = True,
+        team_id: str | None = None,
+        client_factory: ClientFactory = make_client,
+    ):
         self.client = client
+        self.client_factory = client_factory
         # Enterprise Grid org-level tokens must say which workspace they mean.
         self.team = {"team_id": team_id} if team_id else {}
         self.token = token
         self.store = store
         self.download_files = download_files
 
-    def run(self, only_channels: set[str] | None = None) -> None:
+    def run(self, only_channels: set[str] | None = None, channels: bool = True, dms: bool = True) -> None:
         auth = self.client.auth_test()
         log.info("Exporting workspace %s as %s", auth.get("team"), auth.get("user"))
 
         users = self.export_users()
+        if channels:
+            self.export_channels(only_channels)
+        if dms:
+            self.export_dms(users)
+
+        exported = [c for c in self.store.load_channels().values() if c.get("exported")]
+        dm_count = sum(1 for d in self.store.load_dms().values() if d.get("exported"))
+        self.store.save_meta(
+            {
+                "team_id": auth.get("team_id"),
+                "team": auth.get("team"),
+                "url": auth.get("url"),
+                "exported_at": datetime.now(timezone.utc).isoformat(),
+                "exported_on": today(),
+                "users": len(users),
+                "channels": len(exported),
+                "dms": dm_count,
+            }
+        )
+        log.info("Export done: %d users, %d channels, %d DMs", len(users), len(exported), dm_count)
+
+    def export_channels(self, only_channels: set[str] | None = None) -> None:
         channels = self.store.load_channels()
         for ch in paginate(
             self.client.conversations_list,
@@ -94,20 +129,7 @@ class Exporter:
             channels[ch["id"]] = self.export_channel(ch)
             self.store.save_channels(channels)
 
-        exported = [c for c in channels.values() if c.get("exported")]
-        self.store.save_meta(
-            {
-                "team_id": auth.get("team_id"),
-                "team": auth.get("team"),
-                "url": auth.get("url"),
-                "exported_at": datetime.now(timezone.utc).isoformat(),
-                "exported_on": today(),
-                "users": len(users),
-                "channels": len(exported),
-            }
-        )
         skipped = [c for c in channels.values() if not c.get("exported")]
-        log.info("Export done: %d users, %d channels", len(users), len(exported))
         for c in skipped:
             log.warning("Not exported: #%s (%s)", c["name"], c.get("skip_reason"))
 
@@ -186,36 +208,37 @@ class Exporter:
         log.info("#%s: %d messages, %d members", rec["name"], len(messages), len(rec["members"]))
         return rec
 
-    def export_messages(self, channel_id: str) -> dict[str, dict]:
+    def export_messages(self, channel_id: str, client=None, token: str | None = None) -> dict[str, dict]:
+        client = client or self.client
         messages: dict[str, dict] = {}
-        for m in paginate(self.client.conversations_history, "messages", channel=channel_id, limit=200):
+        for m in paginate(client.conversations_history, "messages", channel=channel_id, limit=200):
             messages[m["ts"]] = m
             if m.get("reply_count") and m.get("thread_ts") == m["ts"]:
                 for reply in paginate(
-                    self.client.conversations_replies, "messages", channel=channel_id, ts=m["ts"], limit=200
+                    client.conversations_replies, "messages", channel=channel_id, ts=m["ts"], limit=200
                 ):
                     if reply["ts"] != m["ts"]:
                         messages[reply["ts"]] = reply
 
-        for ts in self._pinned(channel_id):
+        for ts in self._pinned(channel_id, client):
             if ts in messages:
                 messages[ts]["_pinned"] = True
 
         if self.download_files:
             for m in messages.values():
                 for f in m.get("files") or []:
-                    f["_local_path"] = self._download_file(f)
+                    f["_local_path"] = self._download_file(f, token or self.token)
         return messages
 
-    def _pinned(self, channel_id: str) -> set[str]:
+    def _pinned(self, channel_id: str, client=None) -> set[str]:
         try:
-            items = self.client.pins_list(channel=channel_id).get("items") or []
+            items = (client or self.client).pins_list(channel=channel_id).get("items") or []
         except SlackApiError as exc:
             log.warning("pins.list failed for %s: %s", channel_id, error_code(exc))
             return set()
         return {i["message"]["ts"] for i in items if i.get("type") == "message" and i.get("message")}
 
-    def _download_file(self, f: dict) -> str | None:
+    def _download_file(self, f: dict, token: str) -> str | None:
         url = f.get("url_private_download") or f.get("url_private")
         if f.get("mode") in UNDOWNLOADABLE_FILE_MODES or not url:
             return None
@@ -224,9 +247,79 @@ class Exporter:
         if dest.exists():
             return rel
         try:
-            if _download(url, self.token, dest):
+            if _download(url, token, dest):
                 return rel
             log.warning("File %s: got an HTML page instead of the file (missing files:read?)", f.get("name"))
         except Exception as exc:  # noqa: BLE001 - one bad file shouldn't sink the export
             log.warning("File %s download failed: %s", f.get("name"), exc)
         return None
+
+    # ---- direct messages ----------------------------------------------------------
+
+    def export_dms(self, users: dict[str, dict]) -> None:
+        """Export every DM and group DM visible to the people who authorized step 1."""
+        tokens = self.store.load_source_tokens()["users"]
+        if not tokens:
+            log.info("No DM authorizations yet (step 1 of serve-oauth); skipping DMs")
+            return
+        dms = self.store.load_dms()
+        seen: set[str] = set()
+        for email, rec in sorted(tokens.items()):
+            client = self.client_factory(rec["token"])
+            try:
+                client.auth_test()
+            except SlackApiError as exc:
+                log.warning("DM token for %s unusable (%s); they need to authorize step 1 again", email, error_code(exc))
+                continue
+            count = 0
+            try:
+                convs = list(paginate(client.conversations_list, "channels", types="im,mpim", limit=200))
+            except SlackApiError as exc:
+                log.warning("Could not list DMs for %s (%s)", email, error_code(exc))
+                continue
+            for conv in convs:
+                if conv["id"] in seen:
+                    continue
+                rec_dm = self.export_dm(client, rec["token"], rec["user_id"], conv, users)
+                if rec_dm is None:
+                    continue
+                seen.add(conv["id"])
+                dms[conv["id"]] = rec_dm
+                self.store.save_dms(dms)
+                count += rec_dm.get("exported", False)
+            log.info("DMs via %s: %d conversation(s) exported", email, count)
+
+    def export_dm(self, client, token: str, self_id: str, conv: dict, users: dict[str, dict]) -> dict | None:
+        if conv.get("is_im"):
+            members = [self_id] if conv.get("user") == self_id else [self_id, conv.get("user")]
+        else:
+            try:
+                members = list(paginate(client.conversations_members, "members", channel=conv["id"], limit=200))
+            except SlackApiError as exc:
+                log.warning("Group DM %s: could not list members (%s)", conv["id"], error_code(exc))
+                return None
+        # Conversations with Slackbot or app bots can't be recreated as a person-to-person DM.
+        if any((users.get(m) or {}).get("is_bot") or m == "USLACKBOT" for m in members):
+            return None
+
+        names = [(users.get(m) or {}).get("name") or m for m in members]
+        rec = {
+            "id": conv["id"],
+            "name": "dm:" + ",".join(sorted(names)),
+            "is_mpim": bool(conv.get("is_mpim")),
+            "members": members,
+            "created": conv.get("created"),
+            "exported": False,
+            "skip_reason": None,
+        }
+        try:
+            messages = self.export_messages(conv["id"], client, token)
+        except SlackApiError as exc:
+            rec["skip_reason"] = f"history failed: {error_code(exc)}"
+            return rec
+        if not messages:
+            return None
+        self.store.save_messages(conv["id"], messages)
+        rec["exported"] = True
+        rec["message_count"] = len(messages)
+        return rec

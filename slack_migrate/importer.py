@@ -10,6 +10,10 @@ authorized yet are handled per ``ImportOptions.mode``:
 * ``impersonate`` post them now through the bot with the author's name and avatar. The
                   message is marked APP, so this goes against the "really sent by the user" goal.
 
+DMs and group DMs are opened in the target with ``conversations.open`` by one of their
+participants, then replayed the same way. Bots can't post into other people's DMs, so there
+is no impersonate fallback there: messages from departed authors and integrations are dropped.
+
 Progress is saved after every message in target/state.json (old ts -> new ts), so a run
 can be interrupted and resumed, and repeating it is how a delta migration works.
 """
@@ -59,6 +63,7 @@ class ImportOptions:
     general_as_channel: bool = False  # recreate the default channel by name instead of using the target's
     invite_members: bool = True  # invite all original members, not just the people who post
     rename: dict[str, str] = field(default_factory=dict)  # old channel name -> name in the target
+    dms: str | None = None  # include | skip | only; None = include unless `channels` is set
 
 
 @dataclass
@@ -85,6 +90,7 @@ class Importer:
 
         self.users = store.load_users()
         self.channels = store.load_channels()
+        self.dms = store.load_dms()
         self.tokens = store.load_tokens()
         self.state = store.load_state()
 
@@ -149,11 +155,21 @@ class Importer:
         # general first: everyone is in it, so it never waits on channel creation.
         return sorted(chans, key=lambda c: (not c.get("is_general"), c.get("created") or 0, c["name"]))
 
+    @property
+    def dm_mode(self) -> str:
+        return self.opts.dms or ("skip" if self.opts.channels else "include")
+
+    def selected_dms(self) -> list[dict]:
+        if self.dm_mode == "skip":
+            return []
+        dms = [d for d in self.dms.values() if d.get("exported")]
+        return sorted(dms, key=lambda d: (d.get("created") or 0, d["name"]))
+
     # ==== run ======================================================================
 
     def run(self) -> None:
         self.connect()
-        chans = self.selected_channels()
+        chans = self.selected_channels() if self.dm_mode != "only" else []
 
         # Create every channel before posting anything, so #channel mentions in early
         # messages can link to channels that come later in the run.
@@ -168,6 +184,12 @@ class Importer:
         mapper = self.mapper()
         for ch, cst in ready:
             self.import_channel(ch, cst, mapper)
+
+        for dm in self.selected_dms():
+            cst = self.ensure_dm(dm)
+            self.save()
+            if cst:
+                self.import_channel(dm, cst, mapper)
         self.save()
         log.info("Import pass finished. Run `status` to see what's still waiting.")
 
@@ -253,6 +275,59 @@ class Importer:
                 return c["id"]
         raise MigrationError("Could not find the target workspace's default channel")
 
+    # ==== DMs ======================================================================
+
+    def dm_state(self, dm: dict) -> dict:
+        return self.state["dms"].setdefault(dm["id"], {"name": dm["name"], "new_id": None, "dm": True, "members": []})
+
+    def ensure_dm(self, dm: dict) -> dict | None:
+        """Open the same DM / group DM in the target, as one of its authorized participants."""
+        cst = self.dm_state(dm)
+        if cst["new_id"]:
+            return cst
+
+        emails: list[str] = []
+        for old_id in dm.get("members") or []:
+            user = self.users.get(old_id) or {}
+            email = user.get("email")
+            if email in self.new_by_email:
+                emails.append(email)
+            elif not self._departed(user):
+                self._announce(dm["id"] + ":open", "%s waits: %s is not in the new workspace yet", dm["name"], email or old_id)
+                return None
+        emails = list(dict.fromkeys(emails))
+
+        # A group DM that lost people to departures would collapse into someone's 1:1 DM, so it needs 3.
+        need = 3 if dm.get("is_mpim") else len(set(dm.get("members") or []))
+        if len(emails) < need:
+            cst["skipped"] = "a participant will never be in the new workspace"
+            self._announce(dm["id"] + ":skip", "%s skipped: %s", dm["name"], cst["skipped"])
+            return None
+        cst.pop("skipped", None)
+
+        opener = next((e for e in emails if self.user_client(e)), None)
+        if not opener:
+            self._announce(dm["id"] + ":open", "%s waits: none of its participants has authorized yet", dm["name"])
+            return None
+        new_ids = [self.new_by_email[e] for e in emails]
+        others = [n for n in new_ids if n != self.new_by_email[opener]] or new_ids
+
+        if self.opts.dry_run:
+            new_id = f"DRY-{dm['id']}"
+        else:
+            try:
+                new_id = self.user_client(opener).conversations_open(users=",".join(others))["channel"]["id"]
+            except SlackApiError as exc:
+                code = error_code(exc)
+                if code == "missing_scope":
+                    self._announce("dmscope:" + opener, "%s must authorize the new workspace again (DM scopes were added)", opener)
+                else:
+                    log.warning("%s: could not open it in the target (%s)", dm["name"], code)
+                return None
+        cst.update(new_id=new_id, members=new_ids, opened_by=opener)
+        log.info("%s opened as %s by %s", dm["name"], new_id, opener)
+        return cst
+
     def _inviter(self, cst: dict):
         for new_id in cst["members"]:
             client = self.user_client(self.email_by_new.get(new_id))
@@ -283,7 +358,7 @@ class Importer:
         log.info("#%s: %d member(s) added", ch["name"], len(wanted))
 
     def ensure_member(self, ch: dict, cst: dict, poster: Poster) -> bool:
-        if cst.get("general"):
+        if cst.get("general") or cst.get("dm"):
             return True
         if poster.kind == "bot":
             if not ch["is_private"]:
@@ -356,7 +431,7 @@ class Importer:
             posted[ts] = {"status": IGNORED, "reason": subtype}
             return IGNORED
 
-        poster, verdict = self.resolve_poster(m)
+        poster, verdict = self.resolve_dm_poster(m) if cst.get("dm") else self.resolve_poster(m)
         if verdict == IGNORED:
             posted[ts] = {"status": IGNORED, "reason": "author-dropped"}
             return IGNORED
@@ -410,14 +485,31 @@ class Importer:
         if client:
             return Poster("user", client, email=email), POSTED
 
-        # Deactivated in the source but present in the target: they can still authorize.
-        gone = user.get("deleted") and email not in self.new_by_email
-        departed = not email or gone or email in self.opts.never_joining
+        departed = self._departed(user)
         if departed and self.opts.departed == "drop":
             return None, IGNORED
         if (departed and self.opts.departed == "impersonate") or self.opts.mode == "impersonate":
             return self._bot_poster(_display_name(user) or uid or "unknown", user.get("image"))
         return None, WAIT
+
+    def resolve_dm_poster(self, m: dict) -> tuple[Poster | None, str]:
+        # Nobody but the participants can post in a DM, so there is no bot fallback.
+        uid = m.get("user")
+        if m.get("subtype") == "bot_message" or (not uid and m.get("bot_id")):
+            return None, IGNORED
+        user = self.users.get(uid or "") or {}
+        client = self.user_client(user.get("email"))
+        if client:
+            return Poster("user", client, email=user.get("email")), POSTED
+        if self._departed(user) and self.opts.departed != "wait":
+            return None, IGNORED
+        return None, WAIT
+
+    def _departed(self, user: dict) -> bool:
+        email = user.get("email")
+        # Deactivated in the source but present in the target: they can still authorize.
+        gone = user.get("deleted") and email not in self.new_by_email
+        return bool(not email or gone or email in self.opts.never_joining)
 
     def _bot_poster(self, username: str, icon_url: str | None) -> tuple[Poster | None, str]:
         if not self.bot:

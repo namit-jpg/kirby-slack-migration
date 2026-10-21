@@ -35,7 +35,9 @@
         "pins:write",
         "users:read",
         "users:read.email",
-        "users.profile:write"
+        "users.profile:write",
+        "im:write",
+        "mpim:write"
       ]
     },
     "redirect_urls": [

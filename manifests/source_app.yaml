@@ -2,6 +2,9 @@
 # After installing, copy the "Bot User OAuth Token" (xoxb-) into SOURCE_TOKEN.
 # Bots only see private channels they've been invited to: /invite @Migration Exporter in each one,
 # or use the installing admin's "User OAuth Token" (xoxp-) instead to export every channel they're in.
+# DMs: nobody can read other people's DMs, so each person authorizes this app once on the serve-oauth
+# page (step 1). Set the redirect URL below to the same tunnel as the target app and copy
+# Client ID / Client Secret into SOURCE_CLIENT_ID / SOURCE_CLIENT_SECRET.
 display_information:
   name: Migration Exporter
   description: Read-only export of users, channels and messages for a workspace migration.
@@ -10,6 +13,8 @@ features:
     display_name: Migration Exporter
     always_online: false
 oauth_config:
+  redirect_urls:
+    - https://YOUR-TUNNEL.example.com/slack/oauth/callback
   scopes:
     bot:
       - users:read
@@ -32,6 +37,10 @@ oauth_config:
       - files:read
       - reactions:read
       - pins:read
+      - im:read
+      - im:history
+      - mpim:read
+      - mpim:history
 settings:
   org_deploy_enabled: false
   socket_mode_enabled: false

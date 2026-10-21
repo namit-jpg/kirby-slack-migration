@@ -1,8 +1,8 @@
-"""Readiness/progress report: who still has to join or authorize, and what each channel waits on."""
+"""Readiness/progress report: who still has to join or authorize, and what each channel / DM waits on."""
 
 from __future__ import annotations
 
-from .importer import IMPORTABLE_SUBTYPES, POSTED, Importer, MigrationError, _display_name
+from .importer import IGNORED, IMPORTABLE_SUBTYPES, POSTED, Importer, MigrationError, _display_name
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
@@ -28,6 +28,7 @@ def report(importer: Importer) -> str:
     def yn(flag: bool) -> str:
         return ("yes" if flag else "NO") if connected else "?"
 
+    source_tokens = importer.store.load_source_tokens()["users"]
     rows = []
     for u in sorted(importer.users.values(), key=lambda u: (u["deleted"], u.get("email") or "")):
         if u["is_bot"]:
@@ -40,23 +41,21 @@ def report(importer: Importer) -> str:
                 "deactivated" if u["deleted"] else "active",
                 yn(email in importer.new_by_email),
                 yn(importer.user_client(email) is not None),
+                "yes" if email in source_tokens else "NO",
             ]
         )
-    out += ["", "USERS", _table(["email", "name", "source", "in target", "authorized"], rows)]
+    out += ["", "USERS", _table(["email", "name", "source", "in target", "authorized", "DM access"], rows)]
 
     rows = []
     for ch in importer.selected_channels():
-        msgs = importer.store.load_messages(ch["id"])
-        importable = [m for m in msgs.values() if m.get("subtype") in IMPORTABLE_SUBTYPES]
-        posted = importer.state["messages"].get(ch["id"], {})
-        done = sum(1 for m in importable if (posted.get(m["ts"]) or {}).get("status") == POSTED)
+        done, total = _progress(importer, ch)
         cst = importer.state["channels"].get(ch["id"]) or {}
         blocked = cst.get("blocked_on")
         rows.append(
             [
                 ("🔒" if ch["is_private"] else "#") + ch["name"],
                 "yes" if cst.get("new_id") else "no",
-                f"{done}/{len(importable)}",
+                f"{done}/{total}",
                 f"{blocked['author']} ({blocked['date']})" if blocked else "",
             ]
         )
@@ -64,4 +63,26 @@ def report(importer: Importer) -> str:
     out += ["", "CHANNELS", _table(["channel", "created", "posted", "waiting on"], rows)]
     if skipped:
         out += ["", "Not exported: " + ", ".join(f"#{c['name']} ({c.get('skip_reason')})" for c in skipped)]
+
+    source_tokens = importer.store.load_source_tokens()["users"]
+    dms = importer.selected_dms()
+    if dms or source_tokens:
+        rows = []
+        for dm in dms:
+            done, total = _progress(importer, dm)
+            dst = importer.state["dms"].get(dm["id"]) or {}
+            blocked = dst.get("blocked_on")
+            waiting = dst.get("skipped") or (f"{blocked['author']} ({blocked['date']})" if blocked else "")
+            rows.append([dm["name"], "yes" if dst.get("new_id") else "no", f"{done}/{total}", waiting])
+        out += ["", f"DMS ({len(source_tokens)} people gave DM access)"]
+        out.append(_table(["conversation", "opened", "posted", "waiting on"], rows) if rows else "None exported yet.")
     return "\n".join(out)
+
+
+def _progress(importer: Importer, conv: dict) -> tuple[int, int]:
+    msgs = importer.store.load_messages(conv["id"])
+    importable = [m for m in msgs.values() if m.get("subtype") in IMPORTABLE_SUBTYPES]
+    posted = importer.state["messages"].get(conv["id"], {})
+    # Dropped messages (departed authors, bots in DMs) count as handled, so a finished conversation reads n/n.
+    done = sum(1 for m in importable if (posted.get(m["ts"]) or {}).get("status") in (POSTED, IGNORED))
+    return done, len(importable)

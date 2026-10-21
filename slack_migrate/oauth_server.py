@@ -1,11 +1,15 @@
-"""Target-workspace app: a tiny OAuth server that collects one user token per person.
+"""A tiny OAuth server that collects user tokens per person, keyed by email.
 
 Messages can only appear as genuinely sent by a person (no APP badge, real avatar/name)
-when they're posted with that person's own user token (xoxp-). Each user in the new
-workspace opens this page once and clicks "Authorize"; we store their token keyed by email.
+when they're posted with that person's own user token (xoxp-). Each person opens this page
+once and goes through two steps:
 
-The first person to authorize (normally a workspace admin) also installs the app, which
-gives us the bot token used for read-only lookups and the optional bot fallback.
+1. **Old workspace** (only when SOURCE_CLIENT_ID is set): read-only access to their DMs and
+   group DMs. Slack never lets a bot read DMs, so this is the only way to migrate them.
+2. **New workspace**: post messages, reactions and files as them, and open their DMs.
+
+The first person to authorize step 2 (normally a workspace admin) also installs the target
+app, which gives us the bot token used for read-only lookups and the optional bot fallback.
 """
 
 from __future__ import annotations
@@ -26,6 +30,18 @@ from .slack import error_code, today
 from .store import Store
 
 log = logging.getLogger(__name__)
+
+# Old workspace, user token only: enough to read each person's DMs and group DMs.
+SOURCE_USER_SCOPES = [
+    "im:read",
+    "im:history",
+    "mpim:read",
+    "mpim:history",
+    "users:read",
+    "users:read.email",
+    "files:read",
+    "pins:read",
+]
 
 BOT_SCOPES = [
     "users:read",
@@ -50,6 +66,8 @@ USER_SCOPES = [
     "users:read",
     "users:read.email",
     "users.profile:write",
+    "im:write",
+    "mpim:write",
 ]
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -59,39 +77,76 @@ a.btn{{display:inline-block;background:#4a154b;color:#fff;padding:12px 20px;bord
 .muted{{color:#616061;font-size:14px}}</style></head><body>{body}</body></html>"""
 
 
-class OAuthApp:
-    def __init__(self, store: Store, client_id: str, client_secret: str, redirect_uri: str):
-        self.store = store
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.redirect_uri = redirect_uri
-        self.callback_path = urllib.parse.urlparse(redirect_uri).path or "/"
-        self._states: dict[str, float] = {}
+SOURCE, TARGET = "source", "target"
 
-    def authorize_url(self) -> str:
+
+class OAuthApp:
+    def __init__(
+        self,
+        store: Store,
+        client_id: str,
+        client_secret: str,
+        redirect_uri: str,
+        source_client_id: str | None = None,
+        source_client_secret: str | None = None,
+        source_redirect_uri: str | None = None,
+    ):
+        self.store = store
+        self.apps = {TARGET: (client_id, client_secret, redirect_uri)}
+        if source_client_id and source_client_secret:
+            self.apps[SOURCE] = (source_client_id, source_client_secret, source_redirect_uri or redirect_uri)
+        self.callback_paths = {urllib.parse.urlparse(uri).path or "/" for _, _, uri in self.apps.values()}
+        self._states: dict[str, tuple[str, float]] = {}
+
+    @property
+    def collects_dms(self) -> bool:
+        return SOURCE in self.apps
+
+    def authorize_url(self, side: str = TARGET) -> str:
+        client_id, _, redirect_uri = self.apps[side]
+        now = time.time()
+        # The landing page mints a state per button on every view; forget the stale ones.
+        self._states = {k: v for k, v in self._states.items() if now - v[1] < 15 * 60}
         state = secrets.token_urlsafe(24)
-        self._states[state] = time.time()
-        params = {
-            "client_id": self.client_id,
-            "scope": ",".join(BOT_SCOPES),
-            "user_scope": ",".join(USER_SCOPES),
-            "redirect_uri": self.redirect_uri,
-            "state": state,
-        }
+        self._states[state] = (side, now)
+        params = {"client_id": client_id, "redirect_uri": redirect_uri, "state": state}
+        if side == SOURCE:
+            params["user_scope"] = ",".join(SOURCE_USER_SCOPES)
+        else:
+            params["scope"] = ",".join(BOT_SCOPES)
+            params["user_scope"] = ",".join(USER_SCOPES)
         return "https://slack.com/oauth/v2/authorize?" + urllib.parse.urlencode(params)
 
-    def _consume_state(self, state: str) -> bool:
-        created = self._states.pop(state, None)
-        return created is not None and time.time() - created < 15 * 60
+    def _consume_state(self, state: str) -> str | None:
+        side, created = self._states.pop(state, (None, 0.0))
+        return side if side and time.time() - created < 15 * 60 else None
+
+    def _target_button(self) -> str:
+        return f'<a class="btn" href="{html.escape(self.authorize_url(TARGET))}">Authorize the new workspace</a>'
 
     def landing_page(self) -> str:
-        url = html.escape(self.authorize_url())
-        return PAGE.format(
-            body=f"""<h1>Move your messages to the new workspace</h1>
+        if not self.collects_dms:
+            return PAGE.format(
+                body=f"""<h1>Move your messages to the new workspace</h1>
 <p>Authorizing lets the migration post your old messages <b>as you</b>, so they look exactly
 like you wrote them. Your token is stored only on the migration machine and is revoked after
 the migration finishes.</p>
-<p><a class="btn" href="{url}">Authorize with Slack</a></p>
+<p>{self._target_button()}</p>
+<p class="muted">Sign in to the <b>new</b> workspace when Slack asks.</p>"""
+            )
+        source_url = html.escape(self.authorize_url(SOURCE))
+        return PAGE.format(
+            body=f"""<h1>Move your messages to the new workspace</h1>
+<p>Two quick steps. Your tokens are stored only on the migration machine and are revoked after
+the migration finishes.</p>
+<h2>Step 1: old workspace</h2>
+<p>Lets the migration <b>read</b> your direct messages and group DMs so they can be recreated.
+Slack doesn't let anyone else read them, so without this step your DMs stay behind.</p>
+<p><a class="btn" href="{source_url}">Authorize the old workspace</a></p>
+<p class="muted">Sign in to the <b>old</b> workspace when Slack asks.</p>
+<h2>Step 2: new workspace</h2>
+<p>Lets the migration post your old messages <b>as you</b>, so they look exactly like you wrote them.</p>
+<p>{self._target_button()}</p>
 <p class="muted">Sign in to the <b>new</b> workspace when Slack asks.</p>"""
         )
 
@@ -99,16 +154,17 @@ the migration finishes.</p>
         if "error" in query:
             return 400, PAGE.format(body=f"<h1>Authorization cancelled</h1><p>{html.escape(query['error'][0])}</p>")
         code = (query.get("code") or [""])[0]
-        state = (query.get("state") or [""])[0]
-        if not code or not self._consume_state(state):
+        side = self._consume_state((query.get("state") or [""])[0])
+        if not code or not side:
             return 400, PAGE.format(body='<h1>Link expired</h1><p><a href="/">Start again</a>.</p>')
 
+        client_id, client_secret, redirect_uri = self.apps[side]
         try:
             resp = WebClient().oauth_v2_access(
-                client_id=self.client_id,
-                client_secret=self.client_secret,
+                client_id=client_id,
+                client_secret=client_secret,
                 code=code,
-                redirect_uri=self.redirect_uri,
+                redirect_uri=redirect_uri,
             )
         except SlackApiError as exc:
             log.error("oauth.v2.access failed: %s", error_code(exc))
@@ -123,15 +179,28 @@ the migration finishes.</p>
         email = (profile.get("email") or "").strip().lower()
         if not email:
             return 400, PAGE.format(body="<h1>Couldn't read your email</h1><p>users:read.email is required.</p>")
-
-        tokens = self.store.load_tokens()
-        tokens["users"][email] = {
+        name = html.escape(profile.get("display_name") or profile.get("real_name") or email)
+        record = {
             "user_id": authed["id"],
             "team_id": (resp.get("team") or {}).get("id") or (resp.get("enterprise") or {}).get("id"),
             "token": user_token,
             "scopes": authed.get("scope"),
             "authorized_at": datetime.now(timezone.utc).isoformat(),
         }
+
+        if side == SOURCE:
+            source_tokens = self.store.load_source_tokens()
+            source_tokens["users"][email] = record
+            self.store.save_source_tokens(source_tokens)
+            log.info("DM access from %s (%d users total)", email, len(source_tokens["users"]))
+            return 200, PAGE.format(
+                body=f"""<h1>Step 1 done, {name} ✅</h1>
+<p>Now the second step: sign in to the <b>new</b> workspace.</p>
+<p>{self._target_button()}</p>"""
+            )
+
+        tokens = self.store.load_tokens()
+        tokens["users"][email] = record
         if resp.get("access_token"):
             tokens["bot"] = {
                 "token": resp["access_token"],
@@ -142,9 +211,15 @@ the migration finishes.</p>
         self.store.save_tokens(tokens)
         log.info("Authorized %s (%d users total)", email, len(tokens["users"]))
 
-        name = html.escape(profile.get("display_name") or profile.get("real_name") or email)
+        missing_step1 = self.collects_dms and email not in self.store.load_source_tokens()["users"]
+        step1 = (
+            f'<p class="muted">Haven\'t done step 1 yet? <a href="/">Authorize the old workspace</a> '
+            "so your DMs come across too.</p>"
+            if missing_step1
+            else ""
+        )
         return 200, PAGE.format(
-            body=f"<h1>Thanks, {name} ✅</h1><p>You're all set ({today()}). You can close this tab.</p>"
+            body=f"<h1>Thanks, {name} ✅</h1><p>You're all set ({today()}). You can close this tab.</p>{step1}"
         )
 
 
@@ -152,7 +227,7 @@ def serve(app: OAuthApp, host: str, port: int, certfile: str | None = None, keyf
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - http.server API
             parsed = urllib.parse.urlparse(self.path)
-            if parsed.path == app.callback_path:
+            if parsed.path in app.callback_paths:
                 status, body = app.handle_callback(urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/":
                 status, body = 200, app.landing_page()
@@ -177,7 +252,9 @@ def serve(app: OAuthApp, host: str, port: int, certfile: str | None = None, keyf
         ctx.load_cert_chain(certfile, keyfile)
         server.socket = ctx.wrap_socket(server.socket, server_side=True)
         scheme = "https"
-    log.info("OAuth server on %s://%s:%d  (public redirect: %s)", scheme, host, port, app.redirect_uri)
+    log.info("OAuth server on %s://%s:%d  (public redirect: %s)", scheme, host, port, app.apps[TARGET][2])
+    if not app.collects_dms:
+        log.info("SOURCE_CLIENT_ID not set: DMs will not be collected (step 1 is hidden)")
     log.info("Share the public base URL of the redirect with every user of the new workspace.")
     try:
         server.serve_forever()

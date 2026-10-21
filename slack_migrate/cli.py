@@ -54,6 +54,8 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("export", help="dump the source workspace to the data dir")
     p.add_argument("--no-files", action="store_true", help="skip downloading attachments and avatars")
     p.add_argument("--channels", help="comma-separated channel names (default: all)")
+    p.add_argument("--dms", choices=["include", "skip", "only"],
+                   help="DMs and group DMs of people who authorized step 1 (default: include, or skip with --channels)")
 
     p = sub.add_parser("serve-oauth", help="run the page where target users authorize the importer")
     p.add_argument("--host", default="127.0.0.1")
@@ -79,13 +81,15 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--no-invite", action="store_true", help="only add people whose messages get posted")
     p.add_argument("--rename", action="append", default=[], metavar="OLD=NEW",
                    help="create a channel under a different name in the target (repeatable)")
+    p.add_argument("--dms", choices=["include", "skip", "only"],
+                   help="DMs and group DMs (default: include, or skip when --channels is given)")
 
     p = sub.add_parser("sync-profiles", help="copy title/phone/display name/photo onto authorized users")
     p.add_argument("--force", action="store_true")
 
     sub.add_parser("leave-temp-members", help="final cleanup: remove people added only to post a message")
 
-    p = sub.add_parser("revoke-tokens", help="revoke and delete all stored user tokens (end of migration)")
+    p = sub.add_parser("revoke-tokens", help="revoke and delete all stored user tokens, both workspaces (end of migration)")
     p.add_argument("--yes", action="store_true")
 
     args = parser.parse_args(argv)
@@ -101,8 +105,10 @@ def main(argv: list[str] | None = None) -> None:
     try:
         if args.command == "export":
             token = _require("SOURCE_TOKEN")
+            dms = args.dms or ("skip" if args.channels else "include")
             Exporter(make_client(token), token, store, download_files=not args.no_files,
-                     team_id=os.environ.get("SOURCE_TEAM_ID")).run(_csv(args.channels))
+                     team_id=os.environ.get("SOURCE_TEAM_ID")).run(
+                _csv(args.channels), channels=dms != "only", dms=dms != "skip")
 
         elif args.command == "serve-oauth":
             app = OAuthApp(
@@ -110,6 +116,9 @@ def main(argv: list[str] | None = None) -> None:
                 _require("TARGET_CLIENT_ID"),
                 _require("TARGET_CLIENT_SECRET"),
                 _require("TARGET_REDIRECT_URI"),
+                source_client_id=os.environ.get("SOURCE_CLIENT_ID"),
+                source_client_secret=os.environ.get("SOURCE_CLIENT_SECRET"),
+                source_redirect_uri=os.environ.get("SOURCE_REDIRECT_URI"),
             )
             serve(app, args.host, args.port, args.cert, args.key)
 
@@ -131,6 +140,7 @@ def main(argv: list[str] | None = None) -> None:
                 general_as_channel=args.general_as_channel,
                 invite_members=not args.no_invite,
                 rename=_renames(args.rename),
+                dms=args.dms,
             )
             Importer(store, opts).run()
 
@@ -142,16 +152,19 @@ def main(argv: list[str] | None = None) -> None:
 
         elif args.command == "revoke-tokens":
             tokens = store.load_tokens()
+            source_tokens = store.load_source_tokens()
+            total = len(tokens["users"]) + len(source_tokens["users"])
             if not args.yes:
-                sys.exit(f"This revokes {len(tokens['users'])} user token(s). Re-run with --yes.")
-            for email, rec in list(tokens["users"].items()):
-                try:
-                    make_client(rec["token"]).auth_revoke()
-                except SlackApiError as exc:
-                    logging.warning("%s: %s", email, error_code(exc))
-                del tokens["users"][email]
-                logging.info("Revoked %s", email)
-            store.save_tokens(tokens)
+                sys.exit(f"This revokes {total} user token(s) (both workspaces). Re-run with --yes.")
+            for label, bundle, save in (("new", tokens, store.save_tokens), ("old", source_tokens, store.save_source_tokens)):
+                for email, rec in list(bundle["users"].items()):
+                    try:
+                        make_client(rec["token"]).auth_revoke()
+                    except SlackApiError as exc:
+                        logging.warning("%s (%s workspace): %s", email, label, error_code(exc))
+                    del bundle["users"][email]
+                    save(bundle)
+                    logging.info("Revoked %s (%s workspace)", email, label)
 
     except MigrationError as exc:
         sys.exit(f"error: {exc}")
