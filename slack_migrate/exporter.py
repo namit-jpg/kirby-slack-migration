@@ -1,8 +1,9 @@
 """Source-workspace app: dump users, channels, DMs, messages, threads, reactions, pins and files.
 
-Channels are read with SOURCE_TOKEN. DMs and group DMs can only be read with a participant's
-own user token, collected per person by ``serve-oauth`` (step 1 of the authorization page).
-Each conversation is exported once, with the token of whichever participant comes first.
+Channels are read with SOURCE_TOKEN. DMs, group DMs and private channels the bot wasn't invited
+to can only be read with a member's own user token, collected per person by ``serve-oauth``
+(step 1 of the authorization page). Each conversation is exported once, with the token of
+whichever member comes first.
 
 Every run is a full re-export that overwrites the previous snapshot. The importer keys its
 progress on the original message ``ts``, so re-exporting is safe and is exactly how a
@@ -94,7 +95,8 @@ class Exporter:
 
         users = self.export_users()
         if channels:
-            self.export_channels(only_channels)
+            exported_ids = self.export_channels(only_channels)
+            self.export_private_channels(only_channels, exported_ids)
         if dms:
             self.export_dms(users)
 
@@ -114,8 +116,10 @@ class Exporter:
         )
         log.info("Export done: %d users, %d channels, %d DMs", len(users), len(exported), dm_count)
 
-    def export_channels(self, only_channels: set[str] | None = None) -> None:
+    def export_channels(self, only_channels: set[str] | None = None) -> set[str]:
+        """Export every channel the bot can see; returns the IDs exported in this run."""
         channels = self.store.load_channels()
+        exported: set[str] = set()
         for ch in paginate(
             self.client.conversations_list,
             "channels",
@@ -128,10 +132,42 @@ class Exporter:
                 continue
             channels[ch["id"]] = self.export_channel(ch)
             self.store.save_channels(channels)
+            if channels[ch["id"]]["exported"]:
+                exported.add(ch["id"])
 
         skipped = [c for c in channels.values() if not c.get("exported")]
         for c in skipped:
             log.warning("Not exported: #%s (%s)", c["name"], c.get("skip_reason"))
+        return exported
+
+    def export_private_channels(self, only_channels: set[str] | None, exported: set[str]) -> None:
+        """Export private channels the bot isn't in, with the token of a member who did step 1."""
+        tokens = self.store.load_source_tokens()["users"]
+        if not tokens:
+            return
+        channels = self.store.load_channels()
+        for email, rec in sorted(tokens.items()):
+            if "groups:history" not in (rec.get("scopes") or "").split(","):
+                log.warning("%s authorized step 1 before private channels were included; "
+                            "they need to authorize step 1 again", email)
+                continue
+            client = self.client_factory(rec["token"])
+            try:
+                convs = list(paginate(client.conversations_list, "channels", types="private_channel",
+                                      exclude_archived=False, limit=200, **self.team))
+            except SlackApiError as exc:
+                log.warning("Could not list private channels for %s (%s)", email, error_code(exc))
+                continue
+            count = 0
+            for ch in convs:
+                if ch["id"] in exported or (only_channels and ch["name"] not in only_channels):
+                    continue
+                channels[ch["id"]] = self.export_channel(ch, client, rec["token"])
+                self.store.save_channels(channels)
+                if channels[ch["id"]]["exported"]:
+                    exported.add(ch["id"])
+                    count += 1
+            log.info("Private channels via %s: %d exported", email, count)
 
     # ---- users -------------------------------------------------------------------
 
@@ -165,7 +201,8 @@ class Exporter:
 
     # ---- channels ----------------------------------------------------------------
 
-    def export_channel(self, ch: dict) -> dict:
+    def export_channel(self, ch: dict, client=None, token: str | None = None) -> dict:
+        client = client or self.client
         rec = {
             "id": ch["id"],
             "name": ch["name"],
@@ -186,18 +223,18 @@ class Exporter:
                 rec["skip_reason"] = "app is not a member; invite it (or export with an admin user token)"
                 return rec
             try:
-                self.client.conversations_join(channel=ch["id"])
+                client.conversations_join(channel=ch["id"])
             except SlackApiError as exc:
                 rec["skip_reason"] = f"could not join: {error_code(exc)}"
                 return rec
 
         try:
-            rec["members"] = list(paginate(self.client.conversations_members, "members", channel=ch["id"], limit=200))
+            rec["members"] = list(paginate(client.conversations_members, "members", channel=ch["id"], limit=200))
         except SlackApiError as exc:
             log.warning("#%s: could not list members (%s)", rec["name"], error_code(exc))
 
         try:
-            messages = self.export_messages(ch["id"])
+            messages = self.export_messages(ch["id"], client, token)
         except SlackApiError as exc:
             rec["skip_reason"] = f"history failed: {error_code(exc)}"
             return rec

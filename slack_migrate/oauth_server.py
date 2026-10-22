@@ -4,8 +4,9 @@ Messages can only appear as genuinely sent by a person (no APP badge, real avata
 when they're posted with that person's own user token (xoxp-). Each person opens this page
 once and goes through two steps:
 
-1. **Old workspace** (only when SOURCE_CLIENT_ID is set): read-only access to their DMs and
-   group DMs. Slack never lets a bot read DMs, so this is the only way to migrate them.
+1. **Old workspace** (only when SOURCE_CLIENT_ID is set): read-only access to their DMs,
+   group DMs and private channels. Slack never lets a bot read DMs, and the bot only sees
+   private channels it was invited to, so this is how those get migrated.
 2. **New workspace**: post messages, reactions and files as them, and open their DMs.
 
 The first person to authorize step 2 (normally a workspace admin) also installs the target
@@ -31,12 +32,15 @@ from .store import Store
 
 log = logging.getLogger(__name__)
 
-# Old workspace, user token only: enough to read each person's DMs and group DMs.
+# Old workspace, user token only: enough to read each person's DMs, group DMs and the
+# private channels they belong to (the bot only sees private channels it was invited to).
 SOURCE_USER_SCOPES = [
     "im:read",
     "im:history",
     "mpim:read",
     "mpim:history",
+    "groups:read",
+    "groups:history",
     "users:read",
     "users:read.email",
     "files:read",
@@ -153,8 +157,8 @@ the migration finishes.</p>
 <p>Two quick steps. Your tokens are stored only on the migration machine and are revoked after
 the migration finishes.</p>
 <h2>Step 1: old workspace</h2>
-<p>Lets the migration <b>read</b> your direct messages and group DMs so they can be recreated.
-Slack doesn't let anyone else read them, so without this step your DMs stay behind.</p>
+<p>Lets the migration <b>read</b> your direct messages, group DMs and private channels so they
+can be recreated. Slack doesn't let anyone else read them, so without this step they stay behind.</p>
 <p><a class="btn" href="{source_url}">Authorize the old workspace</a></p>
 {self._signin_hint(SOURCE)}
 <h2>Step 2: new workspace</h2>
@@ -205,7 +209,7 @@ Slack doesn't let anyone else read them, so without this step your DMs stay behi
             source_tokens = self.store.load_source_tokens()
             source_tokens["users"][email] = record
             self.store.save_source_tokens(source_tokens)
-            log.info("DM access from %s (%d users total)", email, len(source_tokens["users"]))
+            log.info("DM and private channel access from %s (%d users total)", email, len(source_tokens["users"]))
             return 200, PAGE.format(
                 body=f"""<h1>Step 1 done, {name} ✅</h1>
 <p>Now the second step: sign in to the <b>new</b> workspace.</p>
@@ -227,7 +231,7 @@ Slack doesn't let anyone else read them, so without this step your DMs stay behi
         missing_step1 = self.collects_dms and email not in self.store.load_source_tokens()["users"]
         step1 = (
             f'<p class="muted">Haven\'t done step 1 yet? <a href="/">Authorize the old workspace</a> '
-            "so your DMs come across too.</p>"
+            "so your DMs and private channels come across too.</p>"
             if missing_step1
             else ""
         )

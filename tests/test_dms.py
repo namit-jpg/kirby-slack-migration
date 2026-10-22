@@ -175,6 +175,60 @@ def test_export_dms_once_per_conversation(store):  # noqa: F811
     assert store.load_meta()["dms"] == 2
 
 
+class FakePrivateSource(FakeSource):
+    """A member's token: sees the private channels they belong to."""
+
+    privates = {
+        "P1": {"id": "P1", "name": "leadership", "is_private": True, "is_member": True, "creator": "UAAA",
+               "created": 3, "topic": {"value": "board"}},
+        "PBOT": {"id": "PBOT", "name": "bot-invited", "is_private": True, "is_member": True, "created": 4},
+    }
+    history = {**FakeSource.history, "P1": [{"ts": "3.1", "user": "UAAA", "text": "q3 plan"}],
+               "PBOT": [{"ts": "4.1", "user": "UBBB", "text": "already exported"}]}
+
+    def conversations_list(self, types, team_id=None, **_):
+        assert types == "private_channel" and team_id == "TOLD"
+        return {"channels": list(self.privates.values())}
+
+    def conversations_members(self, channel, **_):
+        return {"members": ["UAAA", "UBBB"]}
+
+
+class FakeBot(FakeSource):
+    """SOURCE_TOKEN: only sees the private channel it was invited to."""
+
+    def conversations_list(self, types, **_):
+        return {"channels": [FakePrivateSource.privates["PBOT"]]}
+
+    def conversations_members(self, channel, **_):
+        return {"members": ["UBBB"]}
+
+    history = FakePrivateSource.history
+
+
+def test_export_private_channels_with_step1_tokens(store, caplog):  # noqa: F811
+    tokens = store.load_source_tokens()
+    tokens["users"] = {"alice@x.com": {"token": "src:UAAA", "user_id": "UAAA", "scopes": "im:history,groups:history"},
+                       "old@x.com": {"token": "src:UOLD", "user_id": "UOLD", "scopes": "im:history"}}
+    store.save_source_tokens(tokens)
+    clients = {}
+
+    def factory(token):
+        return clients.setdefault(token, FakePrivateSource(token))
+
+    bot = FakeBot("bot:UBOT")
+    Exporter(bot, "bot", store, download_files=False, team_id="TOLD", client_factory=factory).run(dms=False)
+
+    channels = store.load_channels()
+    assert channels["P1"]["exported"] and channels["P1"]["is_private"] and channels["P1"]["topic"] == "board"
+    assert channels["P1"]["members"] == ["UAAA", "UBBB"]
+    assert set(store.load_messages("P1")) == {"3.1"}
+    # The bot already exported PBOT, so alice's token doesn't read it again.
+    assert clients["src:UAAA"].calls == ["P1"] and channels["PBOT"]["members"] == ["UBBB"]
+    # A token from before private channels were added is skipped with a hint to re-authorize.
+    assert "src:UOLD" not in clients and "old@x.com authorized step 1 before private channels" in caplog.text
+
+
 # ---- OAuth page ------------------------------------------------------------------------
 
 
@@ -201,7 +255,7 @@ def test_oauth_routes_source_and_target_tokens(store, monkeypatch):  # noqa: F81
     monkeypatch.setattr(oauth_server, "WebClient", FakeWebClient)
     app = oauth_server.OAuthApp(store, "TGT", "s", "https://h/slack/oauth/callback", "SRC", "s2")
     page = app.landing_page()
-    assert "Step 1" in page and "im%3Ahistory" in page and "im%3Awrite" in page
+    assert "Step 1" in page and "im%3Ahistory" in page and "groups%3Ahistory" in page and "im%3Awrite" in page
 
     def state(side):
         return parse_qs(urlparse(app.authorize_url(side)).query)["state"][0]

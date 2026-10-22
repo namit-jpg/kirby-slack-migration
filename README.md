@@ -16,14 +16,16 @@ APP badge.
 
 * **Exporter app** (source workspace): reads users, channels (public and private), members,
   topics, messages, threads, reactions, pins, files and avatars into `migration_data/export/`.
-  DMs and group DMs are read with each participant's own token (see below).
+  DMs, group DMs and private channels the bot wasn't invited to are read with each member's own
+  token (see below).
 * **Importer app** (target workspace): each person authorizes it once through a small OAuth
   page. Their user token (`xoxp-`) is stored under their email. The importer then creates the
   channels, invites the original members, and replays every message using the author's own token.
 * **The shared link** has two steps when DM migration is on: **step 1** gives the Exporter app
-  read access to that person's DMs in the old workspace (stored in `source/tokens.json`),
-  **step 2** is the Importer authorization above. Slack never lets a bot or admin read someone
-  else's DMs, so a person's DMs only move if at least one participant completes step 1.
+  read access to that person's DMs and private channels in the old workspace (stored in
+  `source/tokens.json`), **step 2** is the Importer authorization above. Slack never lets a bot
+  or admin read someone else's DMs, so a person's DMs only move if at least one participant
+  completes step 1. A private channel moves if the bot was invited to it or one member did step 1.
 * **Mapping**: `target/state.json` records old channel ID → new channel ID and, for every
   message, old `ts` → new `ts`. Threads, reactions, pins and `#channel` mentions are all rebuilt
   from this mapping. Because of it, every command can be re-run safely, and re-running is how
@@ -62,7 +64,8 @@ cp .env.example .env
 #    The first person to authorize step 2 (an admin) also installs the bot.
 .venv/bin/python -m slack_migrate serve-oauth
 
-# 2b. Once people have done step 1, export again to pick up their DMs (DMs only is enough)
+# 2b. Once people have done step 1, export again to pick up their DMs and private channels
+#     (`--dms only` is enough when you only need the DMs)
 .venv/bin/python -m slack_migrate export --dms only
 
 # 3. See who has joined / authorized and what each channel is waiting on
@@ -115,6 +118,8 @@ step 1. In the new workspace, one authorized participant opens the same DM / gro
 * DMs with Slackbot or apps are not migrated.
 * People who authorized step 2 before DM support was added must authorize step 2 again
   (new `im:write` / `mpim:write` scopes). `import` logs who.
+* Likewise, people who did step 1 before private channels were included must do step 1 again
+  (new `groups:read` / `groups:history` scopes). `export` logs who.
 
 Other flags: `--channels a,b`, `--stamp-dates` (adds *"Originally sent 12 Mar 2025 14:03 UTC"*),
 `--allow-broadcasts`, `--no-archive`, `--interval`.
@@ -155,7 +160,8 @@ Other flags: `--channels a,b`, `--stamp-dates` (adds *"Originally sent 12 Mar 20
 * **Users** cannot be created through this API. People join through an invite, or through SCIM
   on Business+ and Enterprise Grid plans. Each person must authorize once, because Slack never
   lets one account get a token for someone else.
-* **Not migrated**: DMs nobody in them authorized step 1 for, edit history and the "edited"
+* **Not migrated**: DMs nobody in them authorized step 1 for, private channels neither the bot
+  nor a step 1 member is in, edit history and the "edited"
   marker, custom emoji images, user groups, Canvases, Lists, workflows and huddles. Files that
   the free plan's 90-day limit has hidden are listed as *"(not migrated)"*.
 * **Rate limit**: about 1 message per second per channel, so 3,000 messages take roughly 50 minutes.
